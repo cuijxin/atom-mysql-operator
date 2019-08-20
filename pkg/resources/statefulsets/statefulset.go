@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/blang/semver"
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -139,4 +140,29 @@ func checkSupportGroupExitStateArgs(deployingVersion string) (supportedVer bool)
 		}
 	}()
 
+	supportedVer = false
+
+	ver := semver.New(deployingVersion)
+	minVer := semver.New(minMysqlVersionWithGroupExitStateArgs)
+
+	if ver.LessThan(*minVer) {
+		return
+	}
+
+	supportedVer = true
+	return
+}
+
+// Builds the MySQl operator container for a cluster.
+// The 'mysqlImage' paramter is the image name of the mysql server to use with
+// no version information.. e.g. 'mysql/mysql-server'
+func mysqlServerContainer(cluster *v1alpha1.Cluster, mysqlServerImage string, rootPassword v1.EnvVar, members int, baseServerID uint32) v1.Container {
+	args := []string{
+		"--server_id=$(expr $base + $index)",
+		"--datadir=/var/lib/mysql",
+		"--user=mysql",
+		"--gtid_mode=ON",
+		"--log-bin",
+		"--binlog_checksum=NONE",
+	}
 }
