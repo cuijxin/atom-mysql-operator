@@ -2,13 +2,23 @@ package statefulsets
 
 import (
 	"atom-mysql-operator/pkg/apis/mysql/v1alpha1"
+	"atom-mysql-operator/pkg/constants"
+	agentopts "atom-mysql-operator/pkg/options/agent"
+	operatoropts "atom-mysql-operator/pkg/options/operator"
 	"atom-mysql-operator/pkg/resources/secrets"
+	"atom-mysql-operator/pkg/version"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
-	"github.com/blang/semver"
+	"github.com/coreos/go-semver/semver"
+	apps "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
@@ -19,7 +29,7 @@ const (
 	// MySQLAgentBasePath defines the volume mount path for the MySQL agent
 	MySQLAgentBasePath = "/var/lib/mysql-agent"
 
-	mySQLbackupVolumeName = "mysqlbackupvolume"
+	mySQLBackupVolumeName = "mysqlbackupvolume"
 	mySQLVolumeName       = "mysqlvolume"
 	mySQLSSLVolumeName    = "mysqlsslvolume"
 
@@ -42,7 +52,7 @@ func volumeMounts(cluster *v1alpha1.Cluster) []v1.VolumeMount {
 		SubPath:   "mysql",
 	})
 
-	backupName := mySQLbackupVolumeName
+	backupName := mySQLBackupVolumeName
 	if cluster.Spec.BackupVolumeClaimTemplate != nil {
 		backupName = cluster.Spec.BackupVolumeClaimTemplate.Name
 	}
@@ -164,5 +174,257 @@ func mysqlServerContainer(cluster *v1alpha1.Cluster, mysqlServerImage string, ro
 		"--gtid_mode=ON",
 		"--log-bin",
 		"--binlog_checksum=NONE",
+		"--enforce_gtid_consistency=ON",
+		"--log-slave-updates=ON",
+		"--binlog-format=ROW",
+		"--master-info-repository=TABLE",
+		"--relay-log-info-repository=TABLE",
+		"--transaction-write-set-extraction=XXHASH64",
+		fmt.Sprintf("--replay-log=%s-${index}-relay-bin", cluster.Name),
+		fmt.Sprintf("--report-host=\"%[1]s-${index}.%[1]s\"", cluster.Name),
+		"--log-error-verbosity=3",
 	}
+
+	if cluster.RequiresCustomSSLSetup() {
+		args = append(args,
+			"--ssl-ca=/etc/ssl/mysql/ca.crt",
+			"--ssl-cert=/etc/ssl/mysql/tls.crt",
+			"--ssl-key=/etc/ssl/mysql/tls.key")
+	}
+
+	if checkSupportGroupExitStateArgs(cluster.Spec.Version) {
+		args = append(args, "--loose-group-replication-exit-state-action=READ_ONLY")
+	}
+
+	entryPointArgs := strings.Join(args, " ")
+
+	cmd := fmt.Sprintf(`
+		# Set baseServerID
+		base=%d
+		
+		# Finds the replica index from the hostname, and uses this to define
+		# a unique server id for this instance.
+		index=$(cat /etc/hostname | grep -o '[^-]*$')
+		/entrypoint.sh %s`, baseServerID, entryPointArgs)
+
+	var resourceLimits corev1.ResourceRequirements
+	if cluster.Spec.Resources != nil && cluster.Spec.Resources.Server != nil {
+		resourceLimits = *cluster.Spec.Resources.Server
+	}
+
+	return v1.Container{
+		Name: MySQLServerName,
+		// TODO(apryde): Add BaseImage to cluster CRD.
+		Image: fmt.Sprintf("%s:%s", mysqlServerImage, cluster.Spec.Version),
+		Ports: []v1.ContainerPort{
+			{
+				ContainerPort: 3306,
+			},
+		},
+		VolumeMounts: volumeMounts(cluster),
+		Command:      []string{"/bin/bash", "-ecx", cmd},
+		Env: []v1.EnvVar{
+			rootPassword,
+			{
+				Name:  "MYSQL_ROOT_HOST",
+				Value: "%",
+			},
+			{
+				Name:  "MYSQL_LOG_CONSOLE",
+				Value: "true",
+			},
+		},
+		Resources: resourceLimits,
+	}
+}
+
+func mysqlAgentContainer(cluster *v1alpha1.Cluster, mysqlAgentImage string, rootPassword v1.EnvVar, members int) v1.Container {
+	agentVersion := version.GetBuildVersion()
+	if version := os.Getenv("MYSQL_AGENT_VERSION"); version != "" {
+		agentVersion = version
+	}
+
+	replicationGroupSeeds := getReplicationGroupSeeds(cluster.Name, members)
+
+	var resourceLimits corev1.ResourceRequirements
+	if cluster.Spec.Resources != nil && cluster.Spec.Resources.Agent != nil {
+		resourceLimits = *cluster.Spec.Resources.Agent
+	}
+
+	return v1.Container{
+		Name:         MySQLAgentName,
+		Image:        fmt.Sprintf("%s:%s", mysqlAgentImage, agentVersion),
+		Args:         []string{"--v=4"},
+		VolumeMounts: volumeMounts(cluster),
+		Env: []v1.EnvVar{
+			clusterNameEnvVar(cluster),
+			namespaceEnvVar(),
+			replicationGroupSeedsEnvVar(replicationGroupSeeds),
+			multiMasterEnvVar(cluster.Spec.MultiMaster),
+			rootPassword,
+			{
+				Name: "MY_POD_IP",
+				ValueFrom: &v1.EnvVarSource{
+					FieldRef: &v1.ObjectFieldSelector{
+						FieldPath: "status.podIP",
+					},
+				},
+			},
+		},
+		LivenessProbe: &v1.Probe{
+			Handler: v1.Handler{
+				HTTPGet: &v1.HTTPGetAction{
+					Path: "/live",
+					Port: intstr.FromInt(int(agentopts.DefaultMySQLAgentHeathcheckPort)),
+				},
+			},
+		},
+		ReadinessProbe: &v1.Probe{
+			Handler: v1.Handler{
+				HTTPGet: &v1.HTTPGetAction{
+					Path: "/ready",
+					Port: intstr.FromInt(int(agentopts.DefaultMySQLAgentHeathcheckPort)),
+				},
+			},
+		},
+		Resources: resourceLimits,
+	}
+}
+
+// NewForCluster creates a new StatefulSet for the given Cluster.
+func NewForCluster(cluster *v1alpha1.Cluster, images operatoropts.Images, serviceName string) *apps.StatefulSet {
+	rootPassword := mysqlRootPassword(cluster)
+	members := int(cluster.Spec.Members)
+	baseServerID := cluster.Spec.BaseServerID
+
+	// If a PV isn't specified just use a EmptyDir volume
+	var podVolumes = []v1.Volume{}
+	if cluster.Spec.VolumeClaimTemplate == nil {
+		podVolumes = append(podVolumes, v1.Volume{Name: mySQLVolumeName,
+			VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{Medium: ""}}})
+	}
+
+	// If a Backup PV isn't specified just use a EmptyDir volume
+	if cluster.Spec.BackupVolumeClaimTemplate == nil {
+		podVolumes = append(podVolumes, v1.Volume{Name: mySQLBackupVolumeName,
+			VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{Medium: ""}}})
+	}
+
+	if cluster.RequiresConfigMount() {
+		podVolumes = append(podVolumes, v1.Volume{
+			Name: cluster.Name,
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: cluster.Spec.Config.Name,
+					},
+				},
+			},
+		})
+	}
+
+	if cluster.RequiresCustomSSLSetup() {
+		podVolumes = append(podVolumes, v1.Volume{
+			Name: mySQLSSLVolumeName,
+			VolumeSource: v1.VolumeSource{
+				Projected: &v1.ProjectedVolumeSource{
+					Sources: []v1.VolumeProjection{
+						{
+							Secret: &v1.SecretProjection{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: cluster.Spec.SSLSecret.Name,
+								},
+								Items: []v1.KeyToPath{
+									{
+										Key:  "ca.crt",
+										Path: "ca.crt",
+									},
+									{
+										Key:  "tls.crt",
+										Path: "tls.crt",
+									},
+									{
+										Key:  "tls.key",
+										Path: "tls.key",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	}
+
+	containers := []v1.Container{
+		mysqlServerContainer(cluster, cluster.Spec.Repository, rootPassword, members, baseServerID),
+		mysqlAgentContainer(cluster, images.MySQLAgentImage, rootPassword, members)}
+
+	podLabels := map[string]string{
+		constants.ClusterLabel: cluster.Name,
+	}
+	if cluster.Spec.MultiMaster {
+		podLabels[constants.LabelClusterRole] = constants.ClusterRolePrimary
+	}
+
+	ss := &apps.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cluster.Namespace,
+			Name:      cluster.Name,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(cluster, schema.GroupVersionKind{
+					Group:   v1alpha1.SchemeGroupVersion.Group,
+					Version: v1alpha1.SchemeGroupVersion.Version,
+					Kind:    v1alpha1.ClusterCRDResourceKind,
+				}),
+			},
+			Labels: map[string]string{
+				constants.ClusterLabel:              cluster.Name,
+				constants.MySQLOperatorVersionLabel: version.GetBuildVersion(),
+			},
+		},
+		Spec: apps.StatefulSetSpec{
+			Replicas: &cluster.Spec.Members,
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: podLabels,
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/port":   "8080",
+					},
+				},
+				Spec: v1.PodSpec{
+					// FIXME: LIMITED TO DEFAULT NAMESPACE. Need to dynamically
+					// create service accounts and (cluster role bindings?)
+					// for each namespace.
+					ServiceAccountName: "mysql-agent",
+					NodeSelector:       cluster.Spec.NodeSelector,
+					Affinity:           cluster.Spec.Affinity,
+					Containers:         containers,
+					Volumes:            podVolumes,
+				},
+			},
+			UpdateStrategy: apps.StatefulSetUpdateStrategy{
+				Type: apps.RollingUpdateStatefulSetStrategyType,
+			},
+			ServiceName: serviceName,
+		},
+	}
+
+	if cluster.Spec.ImagePullSecrets != nil {
+		ss.Spec.Template.Spec.ImagePullSecrets = append(ss.Spec.Template.Spec.ImagePullSecrets, cluster.Spec.ImagePullSecrets...)
+	}
+	if cluster.Spec.VolumeClaimTemplate != nil {
+		ss.Spec.VolumeClaimTemplates = append(ss.Spec.VolumeClaimTemplates, *cluster.Spec.VolumeClaimTemplate)
+	}
+	if cluster.Spec.BackupVolumeClaimTemplate != nil {
+		ss.Spec.VolumeClaimTemplates = append(ss.Spec.VolumeClaimTemplates, *cluster.Spec.BackupVolumeClaimTemplate)
+	}
+	if cluster.Spec.SecurityContext != nil {
+		ss.Spec.Template.Spec.SecurityContext = cluster.Spec.SecurityContext
+	}
+	if cluster.Spec.Tolerations != nil {
+		ss.Spec.Template.Spec.Tolerations = *cluster.Spec.Tolerations
+	}
+	return ss
 }
